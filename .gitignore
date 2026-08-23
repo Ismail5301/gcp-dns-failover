@@ -1,0 +1,10 @@
+# Terraform (once added)
+.terraform/
+*.tfstate
+*.tfstate.*
+.terraform.lock.hcl
+*.tfvars
+
+# OS / editor cruft
+.DS_Store
+*.swp
