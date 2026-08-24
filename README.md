@@ -1,143 +1,124 @@
-# Multi-Region L7 HTTPS Failover with Cloud DNS
+# Regional HTTPS Failover to a Non-GCP Backup, with Cloud DNS
 
-A GCP reference architecture for routing HTTPS traffic to one of two regional
-GKE clusters, using Cloud DNS geolocation + failover routing policies to (a)
-pin normal traffic to a specific region for data-residency reasons, and (b)
-fail over to a healthy region — including a region outside GCP — when the
-primary is down.
+A GCP reference architecture for putting a publicly reachable, non-GCP
+disaster-recovery target (on-prem or another cloud) behind a regional GKE
+cluster's HTTPS endpoint, using a Cloud DNS FAILOVER routing policy with
+health checks for external endpoints.
+
+**What this is not:** a single hostname that both geo-pins clients to their
+nearest region AND fails over per region. Cloud DNS's GEO and FAILOVER
+routing policies are separate policy types that cannot be nested -- a GEO
+policy item cannot itself own an independent FAILOVER policy. An earlier
+version of this README implied otherwise; that was wrong, and is corrected
+below. What this repo actually implements: **one independent FAILOVER
+record per region** (`eu.app.example.com`, `us.app.example.com`, ...), each
+pinning that region's traffic to its own GCP stack under normal conditions
+and failing over to that region's own non-GCP backup if the GCP stack goes
+unhealthy.
 
 This repo currently implements the design using `gcloud` only. A Terraform
 implementation is planned (see [Roadmap](#roadmap)).
 
 ---
 
-## Why DNS failover, and why not just a Global External HTTPS LB
+## What this repository demonstrates
 
-For a plain "route to whichever GKE region is healthy" requirement, a single
-**Global External HTTPS LB with zonal NEGs from both clusters attached to one
-backend service** is the better answer, not this repo's approach. GKE
-container-native NEGs carry a real health check, so the LB automatically
-stops sending traffic to an unhealthy region's backends and routes to the
-other region — one anycast IP, failover in single-digit seconds, one
-forwarding rule to pay for. If that's your whole requirement, use that
-instead of what's in this repo.
+1. A regional GKE cluster exposed through a regional external Application
+   Load Balancer with container-native (NEG) backends.
+2. Cloud DNS health checks for external endpoints (GA since Feb 2025) --
+   probing a plain IP:port over the public internet, not a GCP backend's
+   internal health state -- as the mechanism that lets a FAILOVER record's
+   backup target be a non-GCP IP.
+3. Why that matters: a Global External HTTPS LB with hybrid NEGs can also
+   reach non-GCP backends, but only over a private network path (VPN or
+   Interconnect). Cloud DNS's external-endpoint health check needs no such
+   connectivity -- any publicly reachable IP works.
+4. DNS-based failover has materially higher client-observed recovery time
+   than LB-level failover, and a real, quantifiable reason why (a hard
+   30-second health-check floor for this check type, on top of DNS TTL).
+5. A real limitation in Cloud DNS's routing-policy model: GEO and FAILOVER
+   don't compose into a single record, which shaped the final design here.
 
-DNS failover earns its place when either of these is actually true, which
-they are for the scenario this repo targets:
+## Why not just a Global External HTTPS LB?
 
-1. **Data residency / traffic pinning.** A single global LB routes by
-   proximity to the nearest *healthy* backend — it doesn't give you a hard
-   guarantee that, say, EU traffic is served only from EU infrastructure
-   under normal conditions. Cloud DNS's geolocation routing policy (with
-   geofencing enabled) does: it pins traffic to the region mapped to the
-   client's location and does **not** silently fail over to another
-   geolocation just because that's easier — it returns the pinned region's
-   answer unless that entire geolocation's endpoints fail health checks.
-   That's a real, common requirement (regulatory, contractual, or just "we
-   don't want EU customer traffic hairpinning through US infrastructure even
-   during a partial degradation").
+For a plain "route to whichever GKE region is healthy" requirement *within
+GCP*, a single **Global External HTTPS LB with zonal NEGs from both
+clusters attached to one backend service** is the better answer, not this
+repo's approach -- one anycast IP, LB-level health checks, failover in
+single-digit seconds. If your backup target is also a GCP resource, use
+that instead.
 
-2. **A backup target that isn't a GCP-native LB backend at all** — an
-   on-prem data center or a different cloud provider's own load balancer.
-   Attaching that to a *Global External HTTPS LB* as a backend requires a
-   hybrid connectivity NEG, which only works for targets reachable over a
-   private network path (Cloud VPN or Interconnect) — Google's health check
-   probers need to reach the endpoint privately. If that connectivity
-   doesn't exist (a public endpoint sitting in AWS/Azure with its own
-   independent load balancer, or an on-prem site with no Interconnect), you
-   can't attach it as an LB backend at all. Cloud DNS sidesteps this
-   entirely: since Feb 2025, Cloud DNS supports **health checks for external
-   endpoints** in public zones — it probes any public IP:port directly over
-   the internet (three source regions you choose, three probers per region,
-   nine probes total), with no requirement that the target be a GCP
-   resource or privately reachable. That's what makes DNS failover the
-   practical option for a public-facing service with a non-GCP backup: the
-   health-check mechanism only needs the target to be publicly reachable,
-   not privately connected to your VPC.
+This repo's approach earns its place specifically because the backup target
+is **not** a GCP-attachable backend: an on-prem data center or another
+cloud provider's own load balancer, with no private network path (VPN or
+Interconnect) into that environment. Attaching that to a Global LB requires
+a hybrid connectivity NEG, which only works when Google's health check
+probers can reach the target *privately*. If that connectivity doesn't
+exist, you can't attach it as an LB backend at all. Cloud DNS's
+external-endpoint health check sidesteps this: it probes any public IP:port
+directly over the internet (three source regions you choose, three probers
+per region, nine probes total), with no requirement that the target be
+privately reachable.
 
-| Approach | Failover mechanism | Works across clouds/on-prem? | Pins traffic to a region under normal ops? | Failover latency |
-|---|---|---|---|---|
-| Global External HTTPS LB, multi-region NEGs | LB-level health check, single anycast IP | No — NEGs must be GCP-native, or a hybrid NEG requiring private connectivity | No — routes by proximity to nearest healthy backend | Seconds |
-| **Cloud DNS geolocation + failover** (this repo) | Cloud DNS's own external-endpoint health check on the primary IP fails, client re-resolves | Yes — any public IP:port, GCP or not, no private connectivity needed | Yes — geofencing pins traffic to the mapped region | ~90-120s (30s minimum check interval + TTL) |
-| Multi-cluster Gateway / Anthos Service Mesh | Mesh-aware routing across a GKE Fleet | GCP/Anthos-attached clusters only | Not its purpose — built for east-west traffic management | Varies |
-
-The tradeoff for using DNS is the one thing DNS-based routing can never fully
-avoid: it depends on the client re-resolving, and the health check itself has
-a 30-second floor, so failover time is measured in minutes rather than the
-single-digit-second failover a proxy-based LB gets by just dropping an
-unhealthy backend from rotation. That's the real cost of buying
-region-pinning and cross-provider portability with this pattern — worth
-stating plainly rather than glossing over.
+| Approach | Failover mechanism | Works with a non-GCP backup? | Failover latency |
+|---|---|---|---|
+| Global External HTTPS LB, multi-region NEGs | LB-level health check, single anycast IP | Not directly over the public internet -- needs a hybrid NEG with private connectivity | Seconds |
+| **Cloud DNS FAILOVER, per region** (this repo) | Cloud DNS's own external-endpoint health check, client re-resolves | Yes -- any public IP:port, GCP or not | ~90-120s (30s minimum check interval + TTL), see below |
+| Multi-cluster Gateway / Anthos Service Mesh | Mesh-aware routing across a GKE Fleet | GCP/Anthos-attached clusters only | Varies -- not built for this |
 
 ## Architecture
 
 ```mermaid
 flowchart TB
     ClientEU((EU Client))
-    ClientUS((US Client))
-    DNS[Cloud DNS<br/>Geolocation + Failover<br/>routing policy, geofenced]
 
-    subgraph RegionEU["Region A - europe-west1 (pinned for EU traffic)"]
-        LBEU[Regional External<br/>HTTPS LB]
+    subgraph RegionEU["eu.app.example.com -- FAILOVER record"]
+        DNS[Cloud DNS<br/>external-endpoint health check]
+        LBEU[Regional External<br/>HTTPS LB - primary]
         GKEEU[GKE Cluster - EU]
+        Other[On-prem / other-cloud<br/>endpoint - backup]
         LBEU --> GKEEU
     end
 
-    subgraph RegionUS["Region B - us-central1 (pinned for US traffic)"]
-        LBUS[Regional External<br/>HTTPS LB]
-        GKEUS[GKE Cluster - US]
-        LBUS --> GKEUS
-    end
-
-    subgraph Backup["Backup target - outside GCP"]
-        Other[On-prem / other-cloud<br/>endpoint, own health check]
-    end
-
     ClientEU --> DNS
-    ClientUS --> DNS
-    DNS -- "EU traffic, primary" --> LBEU
-    DNS -- "US traffic, primary" --> LBUS
-    DNS -. "EU failover, if region A unhealthy" .-> Other
+    DNS -- "primary, healthy" --> LBEU
+    DNS -. "backup, if LB unhealthy" .-> Other
 
     style RegionEU fill:#f3fff3,stroke:#3a3
-    style RegionUS fill:#f3fff3,stroke:#3a3
-    style Backup fill:#fff3f3,stroke:#d33
+    style Other fill:#fff3f3,stroke:#d33
 ```
 
-Each region's stack is fully independent — its own regional external HTTPS
-LB, its own certs, its own config surface. Cloud DNS is the only thing tying
-them together, which is exactly the point: a bad config push to the EU LB
-can't touch the US stack, and the backup target doesn't need to be a GCP
-resource at all.
+Each region gets its own hostname and its own independent FAILOVER record
+like this one. There is no shared top-level record combining regions --
+see the note at the top of this README for why, and the Roadmap for how a
+single entry point could be layered on top if needed.
 
 ## How failover actually behaves (and the latency tradeoff)
 
 This is a public zone, so Cloud DNS uses **health checks for external
-endpoints** (GA since February 2025): it probes each target IP:port
-directly over the public internet from three Google Cloud source regions
-you choose, three probers per region (nine probes total per endpoint). This
-is a distinct mechanism from the health checks used for internal load
-balancers in private zones, and it comes with a different, harder floor on
-speed:
+endpoints** (GA since February 2025): a standalone global health check
+probes a target IP:port directly over the internet from three Google Cloud
+source regions you choose (three probers per region, nine total). The
+primary target here is referenced by forwarding rule (so Cloud DNS also
+sees that LB's own health state), and the backup is a raw IP checked the
+same way as any other external endpoint.
 
-1. **Health check detection.** The check interval for external-endpoint
-   health checks has a hard floor of **30 seconds** (the allowed range is
-   30-300s) — there's no way to configure a faster probe than that for a
-   public zone. With the minimum 30s interval and a 2-3 consecutive-failure
-   threshold, detection realistically takes **60-90 seconds**, not the
-   10-30s that's achievable with the faster health checks available to
-   internal load balancers.
-2. **DNS caching.** A 30s TTL is standard guidance for fast failover, which
-   covers compliant resolvers; it doesn't cover already-open
-   connections/keep-alives (they don't re-resolve until they reconnect), or
-   clients/resolvers that don't honor TTL.
+1. **Health check detection.** The check interval for this health check
+   type has a hard floor of **30 seconds** (allowed range 30-300s) -- there
+   is no way to configure faster probing for a public zone. With the
+   minimum interval and a 2-3 consecutive-failure threshold, detection
+   realistically takes on the order of 60-90 seconds.
+2. **DNS caching.** A 30-second TTL is standard guidance for fast failover
+   and covers compliant resolvers; it doesn't cover already-open
+   connections/keep-alives (which don't re-resolve until they reconnect),
+   or resolvers/clients that don't honor TTL.
 
-Combined, **90-120 seconds is a realistic floor** for new connections to
-actually reach the backup, once you account for both the 30s interval floor
-and a TTL on top of it. This is worth stating precisely rather than rounding
-down to a nicer-sounding "30-60s" figure: the 30-second minimum on external
-endpoint health checks is a hard product constraint, not a tuning choice,
-and it's the single biggest factor in this architecture's failover time.
+Combined: **expect failover for new connections on the order of roughly 1-2
+minutes**, with the 30-second health-check floor as the dominant, hard
+constraint. Treat that as a realistic order of magnitude, not a precise
+SLA -- actual client-observed recovery also depends on probe timing,
+threshold configuration, resolver caching behavior, and connection reuse,
+several of which aren't fully under your control.
 
 ## Repo layout
 
@@ -145,146 +126,55 @@ and it's the single biggest factor in this architecture's failover time.
 .
 ├── README.md
 ├── scripts/
-│   ├── 01-create-regional-lb.sh            # regional ext. HTTPS LB + health check, per region
-│   ├── 02-create-dns-geo-failover-record.sh
+│   ├── 01-create-regional-lb.sh              # proxy-only subnet, firewall, regional ext. HTTPS LB
+│   ├── 02-create-regional-failover-record.sh # FAILOVER record for one region
 │   └── 03-test-failover.sh
 ├── manifests/
-│   └── sample-app.yaml                     # Deployment + Service (NEG-enabled)
+│   └── sample-app.yaml                       # Deployment + Service (NEG-enabled), plain HTTP :8080
 └── terraform/
-    └── README.md                           # "in progress" placeholder
+    └── README.md                             # "in progress" placeholder
 ```
 
 ## Implementation walkthrough (gcloud)
 
-Assumes two GKE clusters (`cluster-eu` in `europe-west1`, `cluster-us` in
-`us-central1`) each running the same Deployment/Service, and a Cloud DNS
-managed zone for your domain. The backup target for this walkthrough is
-modeled as a third static IP, standing in for an on-prem or other-cloud
-endpoint — swap in whatever's actually behind it.
+Assumes a GKE cluster (`cluster-eu` in `europe-west1`) running the sample
+app, a VPC network with a subnet for backends already set up, and a Cloud
+DNS managed zone for your domain. You'll need a self-managed SSL cert/key
+pair on disk -- regional external Application LBs don't support Google-managed
+certs (see the note in `01-create-regional-lb.sh`).
 
-### 1. Reserve a static IP and create the regional external HTTPS LB, per region
-
-```bash
-REGION=europe-west1
-CLUSTER=cluster-eu
-NAME=app-region-eu
-
-gcloud compute addresses create ${NAME}-ip \
-  --region=${REGION}
-
-gcloud compute health-checks create https ${NAME}-hc \
-  --region=${REGION} \
-  --port=443 \
-  --request-path=/healthz \
-  --check-interval=10s \
-  --unhealthy-threshold=3
-
-gcloud compute backend-services create ${NAME}-bs \
-  --load-balancing-scheme=EXTERNAL_MANAGED \
-  --protocol=HTTPS \
-  --region=${REGION} \
-  --health-checks=${NAME}-hc
-
-gcloud compute backend-services add-backend ${NAME}-bs \
-  --region=${REGION} \
-  --network-endpoint-group=${CLUSTER}-neg \
-  --network-endpoint-group-zone=${REGION}-a \
-  --balancing-mode=RATE \
-  --max-rate-per-endpoint=100
-
-gcloud compute ssl-certificates create ${NAME}-cert \
-  --region=${REGION} \
-  --domains=eu.app.example.com
-
-gcloud compute target-https-proxies create ${NAME}-proxy \
-  --region=${REGION} \
-  --url-map=${NAME}-urlmap \
-  --ssl-certificates=${NAME}-cert
-
-gcloud compute forwarding-rules create ${NAME}-fr \
-  --region=${REGION} \
-  --load-balancing-scheme=EXTERNAL_MANAGED \
-  --address=${NAME}-ip \
-  --target-https-proxy=${NAME}-proxy \
-  --ports=443
-```
-
-Repeat for `us-central1` / `cluster-us` with `NAME=app-region-us`.
-
-### 2. Create the Cloud DNS geolocation + failover record
-
-**This is a public zone**, so Cloud DNS uses **health checks for external
-endpoints** — it probes a plain IP:port directly over the internet, rather
-than reading a load balancer's internal backend-service health state (that
-forwarding-rule-reference mechanism is only for internal load balancers in
-private zones). Create the standalone health check first, then point the
-records at it:
+### 1. Create the regional external HTTPS LB (proxy-only subnet, firewall rule, LB)
 
 ```bash
-ZONE=app-zone
-EU_LB_IP=$(gcloud compute addresses describe app-region-eu-ip --region=europe-west1 --format="value(address)")
-US_LB_IP=$(gcloud compute addresses describe app-region-us-ip --region=us-central1 --format="value(address)")
-
-# Standalone health check probing the IP:port directly -- not attached to
-# any backend service. --check-interval has a hard floor of 30s for this
-# health check type. Probes run from the three listed source regions, three
-# probers per region (nine probes total per endpoint).
-gcloud beta compute health-checks create https app-hc \
-  --global \
-  --check-interval=30 \
-  --source-regions=europe-west1,us-central1,us-east1 \
-  --port=443 \
-  --request-path=/healthz
-
-gcloud dns record-sets create app.example.com. \
-  --zone=${ZONE} \
-  --type=A \
-  --ttl=30 \
-  --routing-policy-type=GEO \
-  --enable-geo-fencing \
-  --routing-policy-item="location=europe-west1,rrdatas=${EU_LB_IP},external_endpoints=${EU_LB_IP}" \
-  --routing-policy-item="location=us-central1,rrdatas=${US_LB_IP},external_endpoints=${US_LB_IP}" \
-  --health-check=app-hc
+REGION=europe-west1 \
+NAME=app-region-eu \
+NEG_NAME=cluster-eu-neg \
+ZONE=europe-west1-a \
+NETWORK=default \
+PROXY_SUBNET_RANGE=10.129.0.0/23 \
+CERT_FILE=./eu-cert.pem \
+KEY_FILE=./eu-key.pem \
+./scripts/01-create-regional-lb.sh
 ```
 
-For the failover leg to a non-GCP backup (on-prem or another cloud), add a
-`FAILOVER` policy scoped to the EU entry — the backup is just another public
-IP, checked by the same health check:
+Repeat for `us-central1` / `cluster-us` with `NAME=app-region-us` and a
+different `PROXY_SUBNET_RANGE` (proxy-only subnets are per-region, but the
+range still needs to not collide with anything else in that region's VPC).
+
+### 2. Create the FAILOVER record for that region
 
 ```bash
-BACKUP_IP=203.0.113.10   # on-prem or other-cloud public IP
-
-gcloud dns record-sets create eu.app.example.com. \
-  --zone=${ZONE} \
-  --type=A \
-  --ttl=30 \
-  --routing-policy-type=FAILOVER \
-  --routing-policy-primary-data="${EU_LB_IP}" \
-  --routing-policy-backup-data-type=GEO \
-  --routing-policy-backup-item="location=europe-west1,rrdatas=${BACKUP_IP},external_endpoints=${BACKUP_IP}" \
-  --backup-data-trickle-ratio=0 \
-  --health-check=app-hc
+ZONE=app-zone \
+DOMAIN=eu.app.example.com. \
+REGION=europe-west1 \
+PRIMARY_FORWARDING_RULE=app-region-eu-fr \
+BACKUP_IP=203.0.113.10 \
+./scripts/02-create-regional-failover-record.sh
 ```
 
-Notes:
-- The health check itself (`gcloud beta compute health-checks create`) is
-  still under the `beta` command group as of this writing — run
-  `gcloud components install beta` if you don't have it. The DNS record-set
-  commands are not beta.
-- `rrdatas` and `external_endpoints` are both set to the same IP here —
-  `rrdatas` is what Cloud DNS actually returns to clients, `external_endpoints`
-  is what tells Cloud DNS which IP to associate with the referenced health
-  check's results for that routing policy item.
-- The same `app-hc` health check works identically whether the target is a
-  GCP regional LB IP or the on-prem/other-cloud backup IP — Cloud DNS is
-  just probing an IP:port over the public internet either way. This is the
-  concrete mechanism behind the "works uniformly across providers" point
-  above.
-- `--enable-geo-fencing` is what keeps EU traffic in EU under normal
-  conditions instead of silently drifting to whichever region is closest.
-- The 30-second minimum check interval (see the latency section above)
-  applies here — there's no way to configure faster detection than that for
-  a public-zone external endpoint.
+Repeat for `us.app.example.com` with that region's forwarding rule and
+backup IP. The `app-hc` health check is created once (global) and reused
+across regions -- the script checks for it before creating it.
 
 ### 3. Test the failover
 
@@ -296,34 +186,52 @@ DOMAIN=eu.app.example.com \
 ./scripts/03-test-failover.sh
 ```
 
-Expect the flip to take roughly 90-120 seconds, not 30-60 — the script
-breaks the LB's own backend health check, which in turn makes Cloud DNS's
+Expect the flip to take roughly 90-120 seconds -- the script breaks the
+LB's own backend health check, which in turn makes Cloud DNS's
 external-endpoint health check on that LB's public IP start failing, and
 that outer check has the 30-second minimum interval described above.
 
 ## Roadmap
 
 - [ ] Terraform module covering everything in `scripts/`
+- [ ] A documented pattern for a single entry-point hostname that routes
+      clients to the correct regional hostname (e.g. a GEO record whose
+      rrdata per location is the regional hostname's current IP, refreshed
+      alongside failover) -- Cloud DNS doesn't support nesting GEO and
+      FAILOVER natively, so this needs its own design writeup rather than
+      being assumed to work
 - [ ] GitHub Actions workflow that runs `03-test-failover.sh` against a
       staging zone on a schedule
 - [ ] Cloud Monitoring alert policy on health-check state transitions
+- [ ] Evaluate Certificate Manager (regional Google-managed certs via DNS
+      authorization) as an alternative to the self-managed certs used here
 
 ## References
 
-- [DNS routing policies and health checks](https://cloud.google.com/dns/docs/routing-policies-overview) —
-  geolocation, failover, and WRR policies; the distinction between health
-  checks for internal load balancers (private zones) and external endpoints
-  (public zones), and geofencing behavior.
-- [Configure DNS routing policies and health checks](https://cloud.google.com/dns/docs/configure-routing-policies) —
-  exact `gcloud` syntax for both mechanisms; source for the commands in
-  `scripts/02-create-dns-geo-failover-record.sh`, including the 30-300s
-  check-interval range for external endpoints.
-- [Container-native load balancing](https://cloud.google.com/kubernetes-engine/docs/concepts/container-native-load-balancing) —
-  how GKE NEGs get real backend health checks, referenced in the "why not a
-  Global LB" section above.
-- [Container-native load balancing through standalone zonal NEGs](https://cloud.google.com/kubernetes-engine/docs/how-to/standalone-neg) —
+- [DNS routing policies and health checks](https://cloud.google.com/dns/docs/routing-policies-overview) --
+  geolocation, failover, and WRR policy types; health checks for internal
+  load balancers vs. external endpoints; geofencing behavior (including
+  that a geofenced GEO record does not fail over to another location even
+  if all endpoints in the client's mapped location are unhealthy).
+- [Configure DNS routing policies and health checks](https://cloud.google.com/dns/docs/configure-routing-policies) --
+  exact `gcloud` syntax, including the 30-300s check-interval range for
+  external-endpoint health checks.
+- [gcloud dns record-sets create reference](https://docs.cloud.google.com/sdk/gcloud/reference/dns/record-sets/create) --
+  authoritative flag reference; confirms `--routing-policy-primary-data`
+  only accepts forwarding-rule references (not raw IPs), while
+  `--routing-policy-backup-item` supports `external_endpoints` for raw,
+  health-checked IPs.
+- [Container-native load balancing](https://cloud.google.com/kubernetes-engine/docs/concepts/container-native-load-balancing) --
+  how GKE NEGs get real backend health checks.
+- [Container-native load balancing through standalone zonal NEGs](https://cloud.google.com/kubernetes-engine/docs/how-to/standalone-neg) --
   attaching a GKE Service's NEG to a manually-configured backend service,
   what `01-create-regional-lb.sh` relies on.
-- [Hybrid connectivity NEGs overview](https://cloud.google.com/load-balancing/docs/negs/hybrid-neg-concepts) —
+- [Proxy-only subnets for Envoy-based load balancers](https://cloud.google.com/load-balancing/docs/proxy-only-subnets) --
+  why regional external Application LBs need a dedicated subnet, created in
+  `01-create-regional-lb.sh`.
+- [Use Google-managed SSL certificates](https://cloud.google.com/load-balancing/docs/ssl-certificates/google-managed-certs) --
+  confirms Google-managed certs are **not** supported for regional external
+  Application LBs, hence the self-managed cert step in this repo.
+- [Hybrid connectivity NEGs overview](https://cloud.google.com/load-balancing/docs/negs/hybrid-neg-concepts) --
   why on-prem/other-cloud backends need private connectivity to be attached
   as a Global LB backend, the gap this repo's DNS-based approach avoids.
