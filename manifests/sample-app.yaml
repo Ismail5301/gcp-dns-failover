@@ -4,6 +4,19 @@
 #
 # The NEG name GKE generates is discoverable after apply via:
 #   kubectl get svc sample-app -o jsonpath='{.metadata.annotations.cloud\.google\.com/neg-status}'
+#
+# NOTE on /healthz: gcr.io/google-samples/hello-app:2.0 does not implement
+# a dedicated /healthz route. Its Go handler is registered on "/" only,
+# which Go's default http.ServeMux treats as a catch-all for any path
+# that has no more specific handler -- so a GET to /healthz (or any other
+# path) still hits that handler and returns 200. That's why the readiness
+# probe and the backend health checks in 01-create-regional-lb.sh and
+# 03-test-failover.sh, which all target /healthz, work correctly here.
+# It's not accidental breakage, but it IS a coincidence of this specific
+# image rather than a real health endpoint -- if you swap in your own
+# app image, make sure it actually implements /healthz (checking real
+# dependencies, not just "process is up") before relying on this same
+# health-check path.
 
 apiVersion: apps/v1
 kind: Deployment
@@ -38,7 +51,10 @@ kind: Service
 metadata:
   name: sample-app
   annotations:
-    cloud.google.com/neg: '{"exposed_ports": {"443":{"name": "cluster-region-neg"}}}'
+    # Named for what it fronts (HTTPS at the LB, plain HTTP to the pod) --
+    # was "cluster-region-neg", renamed for clarity when reading NEG
+    # listings across multiple regions/services.
+    cloud.google.com/neg: '{"exposed_ports": {"443":{"name": "sample-app-https-neg"}}}'
 spec:
   type: ClusterIP
   selector:
