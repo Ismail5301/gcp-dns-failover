@@ -9,7 +9,13 @@ Terraform provider expose the same underlying API a little differently.
 
 - **Overview** -- routing policy types, health-check scope (internal LB vs
   external endpoint), the 30-300s check-interval range for external
-  endpoints, geofencing behavior:
+  endpoints, geofencing behavior. Also the two facts behind this module's
+  Known Limitations: (1) fail-open -- if every target in a policy is
+  unhealthy, Cloud DNS still returns them rather than SERVFAIL; (2)
+  external-endpoint probes "don't originate from fixed IP address
+  ranges" -- unlike GCP's own LB-to-backend health checks
+  (35.191.0.0/16 / 130.211.0.0/22), so a non-GCP backup's firewall must
+  allow any source IP on the health-check port:
   https://cloud.google.com/dns/docs/routing-policies-overview
 
 - **Configure routing policies and health checks** -- exact `gcloud` and
@@ -19,7 +25,10 @@ Terraform provider expose the same underlying API a little differently.
   (`--health-check=NAME` against a standalone health check, external
   endpoints only). This is the doc that resolves the "which health-check
   flag" question for a public-zone FAILOVER record with a forwarding-rule
-  primary:
+  primary. Also confirms `dns.networks.useHealthSignals` is required only
+  for policies with health checks on internal passthrough Network Load
+  Balancers -- not for internal Application LB policies, and not relevant
+  to this repo's public zone at all:
   https://cloud.google.com/dns/docs/configure-routing-policies
 
 - **gcloud dns record-sets create reference** -- authoritative flag

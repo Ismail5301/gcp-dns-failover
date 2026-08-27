@@ -3,16 +3,21 @@
 # scripts/01-create-regional-lb.sh and
 # scripts/02-create-regional-failover-record.sh once per region.
 #
-# The external-endpoint health check (app-hc in the gcloud script) is
-# created ONCE here, globally, and shared across all regions' DNS
-# records -- same as the gcloud script's "create if it doesn't already
-# exist" check.
+# The external-endpoint health check (${NAME}-dns-hc in the gcloud script)
+# is created ONE PER REGION, not as a single shared check. Reason: the
+# check's `host` attribute can only hold one value, and each region's
+# FAILOVER record probes a different domain (eu.app.example.com vs
+# us.app.example.com) -- a shared check would have to send an arbitrary
+# Host header for at least one of them. See the README's "Known
+# limitations" section.
 #
-# Reference: gcloud beta compute health-checks create https ...
-# https://cloud.google.com/sdk/gcloud/reference/beta/compute/health-checks/create/https
+# Reference: google_compute_health_check `source_regions` / `host` args --
+# https://github.com/hashicorp/terraform-provider-google/blob/main/website/docs/r/compute_health_check.html.markdown
 
 resource "google_compute_health_check" "app_hc" {
-  name = "app-hc"
+  for_each = var.regions
+
+  name = "app-region-${each.key}-dns-hc"
 
   # Hard floor of 30s for this health check type -- see
   # https://cloud.google.com/dns/docs/routing-policies-overview
@@ -23,6 +28,7 @@ resource "google_compute_health_check" "app_hc" {
   https_health_check {
     port         = 443
     request_path = "/healthz"
+    host         = trimsuffix(each.value.domain, ".")
   }
 }
 
@@ -50,5 +56,5 @@ module "dns_failover" {
   region          = each.value.region
   primary_ip      = module.regional_lb[each.key].ip_address
   backup_ip       = each.value.backup_ip
-  health_check_id = google_compute_health_check.app_hc.id
+  health_check_id = google_compute_health_check.app_hc[each.key].id
 }

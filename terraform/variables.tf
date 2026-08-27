@@ -15,9 +15,14 @@ variable "dns_zone" {
 }
 
 variable "global_health_check_source_regions" {
-  description = "Source regions for the shared external-endpoint health check (app-hc). Pick 3, per the gcloud script's default."
+  description = "Source regions used by every region's external-endpoint health check (app-region-<key>-dns-hc). Must be exactly 3 if set -- Cloud DNS rejects anything else. Same 3 regions are reused across all per-region checks; only the check's host/target differs per region."
   type        = list(string)
   default     = ["europe-west1", "us-central1", "us-east1"]
+
+  validation {
+    condition     = length(var.global_health_check_source_regions) == 3
+    error_message = "Cloud DNS requires exactly 3 source_regions for this health check type -- see https://cloud.google.com/dns/docs/routing-policies-overview."
+  }
 }
 
 variable "regions" {
