@@ -63,7 +63,7 @@ privately reachable.
 | Approach | Failover mechanism | Works with a non-GCP backup? | Failover latency |
 |---|---|---|---|
 | Global External HTTPS LB, multi-region NEGs | LB-level health check, single anycast IP | Not directly over the public internet, needs a hybrid NEG with private connectivity | Seconds |
-| **Cloud DNS FAILOVER, per region** (this repo) | Cloud DNS's own external-endpoint health check, client re-resolves | Yes, any public IP:port, GCP or not | ~90-120s (30s minimum check interval + TTL), see below -- and only while at least one target answers, see Known limitations |
+| **Cloud DNS FAILOVER, per region** (this repo) | Cloud DNS's own external-endpoint health check, client re-resolves | Yes, any public IP:port, GCP or not | ~90-120s (30s minimum check interval + TTL), see below - and only while at least one target answers, see Known limitations |
 | Multi-cluster Gateway / Anthos Service Mesh | Mesh-aware routing across a GKE Fleet | GCP/Anthos-attached clusters only | Varies, not built for this |
 
 ## Architecture
@@ -89,14 +89,14 @@ flowchart TB
 ```
 
 Each region gets its own hostname and its own independent FAILOVER record
-like this one. There is no shared top-level record combining regions --
+like this one. There is no shared top-level record combining regions,
 see the note at the top of this README for why, and the Roadmap for how a
 single entry point could be layered on top if needed.
 
 ## How failover actually behaves (and the latency tradeoff)
 
 This is a public zone, so Cloud DNS uses **health checks for external
-endpoints** (GA since February 2025) -- a different data source from
+endpoints** (GA since February 2025), a different data source from
 private-zone failover, and it's worth being precise about which one this
 repo uses:
 
@@ -112,19 +112,19 @@ repo uses:
 
 The primary target is written as a forwarding-rule reference
 (`app-region-eu-fr@europe-west1`). In a public zone, that's only how
-`gcloud` resolves the VIP to put in the record -- the health signal is
+`gcloud` resolves the VIP to put in the record, the health signal is
 still the standalone health check probing that VIP over the public
 internet, **not** the LB's backend-service health. A separate, *inner*
 health check (`app-region-eu-hc`, HTTP `:8080` `/healthz` against the
 GKE NEG) only decides whether the regional LB itself has healthy pods to
-serve traffic from -- Cloud DNS never sees that check. Failover happens
+serve traffic from, Cloud DNS never sees that check. Failover happens
 when the *outer* health check (`app-region-eu-dns-hc`, HTTPS `:443`
 `/healthz` against the VIP) stops getting a `200`, which is why
 `03-test-failover.sh` breaks the inner check: that makes the LB stop
 serving `200`s, which then fails the outer, DNS-facing check.
 
 1. **Health check detection.** The check interval for this health check
-   type has a hard floor of **30 seconds** (allowed range 30-300s) -- there
+   type has a hard floor of **30 seconds** (allowed range 30-300s), there
    is no way to configure faster probing for a public zone. With the
    minimum interval and a 2-3 consecutive-failure threshold, detection
    realistically takes on the order of 60-90 seconds.
@@ -136,14 +136,14 @@ serving `200`s, which then fails the outer, DNS-facing check.
 Combined: **expect failover for new connections on the order of roughly 1-2
 minutes**, with the 30-second health-check floor as the dominant, hard
 constraint. Treat that as a realistic order of magnitude, not a precise
-SLA -- actual client-observed recovery also depends on probe timing,
+SLA, actual client-observed recovery also depends on probe timing,
 threshold configuration, resolver caching behavior, and connection reuse,
 several of which aren't fully under your control.
 
 ## Known limitations
 
 - **Fail-open on total outage.** If every target in a FAILOVER policy is
-  unhealthy -- both the primary VIP and the backup IP -- Cloud DNS still
+  unhealthy, both the primary VIP and the backup IP, Cloud DNS still
   returns those IPs rather than serving `SERVFAIL`. Clients get an address
   that doesn't work. This is documented platform behavior
   ([source](https://cloud.google.com/dns/docs/routing-policies-overview)),
@@ -151,13 +151,13 @@ several of which aren't fully under your control.
 - **The non-GCP backup's firewall must allow any source IP** on
   `:443`/`/healthz`. Cloud DNS's external-endpoint probes don't originate
   from the fixed `35.191.0.0/16` / `130.211.0.0/22` ranges that GCP load
-  balancers use for their own backend health checks -- those ranges only
+  balancers use for their own backend health checks, those ranges only
   apply to the *inner* NEG-facing check, not to Cloud DNS's outer probe.
   Locking the backup's firewall down to those ranges will make it look
   permanently unhealthy.
 - **One health check per region, not shared.** Each region's FAILOVER
   record uses its own `${NAME}-dns-hc` health check with a `--host` set to
-  that region's domain, rather than one shared global check -- a shared
+  that region's domain, rather than one shared global check, a shared
   check can only carry one `Host` header, which would be wrong for every
   region but one.
 
@@ -184,7 +184,7 @@ several of which aren't fully under your control.
 Assumes a GKE cluster (`cluster-eu` in `europe-west1`) running the sample
 app, a VPC network with a subnet for backends already set up, and a Cloud
 DNS managed zone for your domain. You'll need a self-managed SSL cert/key
-pair on disk -- regional external Application LBs don't support Google-managed
+pair on disk, regional external Application LBs don't support Google-managed
 certs (see the note in `01-create-regional-lb.sh`).
 
 ### 1. Create the regional external HTTPS LB (proxy-only subnet, firewall rule, LB)
@@ -219,7 +219,7 @@ BACKUP_IP=203.0.113.10 \
 
 Repeat for `us.app.example.com` with that region's `NAME`, forwarding rule,
 and backup IP. Each region gets its **own** `${NAME}-dns-hc` health check
-(not a shared one) so its `--host` can match that region's domain -- see
+(not a shared one) so its `--host` can match that region's domain, see
 Known limitations.
 
 ### 3. Test the failover
@@ -233,7 +233,7 @@ BACKUP_IP=203.0.113.10 \
 ./scripts/03-test-failover.sh
 ```
 
-Expect the flip to take roughly 90-120 seconds -- the script breaks the
+Expect the flip to take roughly 90-120 seconds, the script breaks the
 LB's own backend health check, which in turn makes Cloud DNS's
 external-endpoint health check on that LB's public IP start failing, and
 that outer check has the 30-second minimum interval described above.
@@ -244,7 +244,7 @@ that outer check has the 30-second minimum interval described above.
 - [ ] A documented pattern for a single entry-point hostname that routes
       clients to the correct regional hostname (e.g. a GEO record whose
       rrdata per location is the regional hostname's current IP, refreshed
-      alongside failover) -- Cloud DNS doesn't support nesting GEO and
+      alongside failover),  Cloud DNS doesn't support nesting GEO and
       FAILOVER natively, so this needs its own design writeup rather than
       being assumed to work
 - [ ] GitHub Actions workflow that runs `03-test-failover.sh` against a
