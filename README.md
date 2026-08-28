@@ -62,9 +62,9 @@ privately reachable.
 
 | Approach | Failover mechanism | Works with a non-GCP backup? | Failover latency |
 |---|---|---|---|
-| Global External HTTPS LB, multi-region NEGs | LB-level health check, single anycast IP | Not directly over the public internet -- needs a hybrid NEG with private connectivity | Seconds |
-| **Cloud DNS FAILOVER, per region** (this repo) | Cloud DNS's own external-endpoint health check, client re-resolves | Yes -- any public IP:port, GCP or not | ~90-120s (30s minimum check interval + TTL), see below -- and only while at least one target answers, see Known limitations |
-| Multi-cluster Gateway / Anthos Service Mesh | Mesh-aware routing across a GKE Fleet | GCP/Anthos-attached clusters only | Varies -- not built for this |
+| Global External HTTPS LB, multi-region NEGs | LB-level health check, single anycast IP | Not directly over the public internet, needs a hybrid NEG with private connectivity | Seconds |
+| **Cloud DNS FAILOVER, per region** (this repo) | Cloud DNS's own external-endpoint health check, client re-resolves | Yes, any public IP:port, GCP or not | ~90-120s (30s minimum check interval + TTL), see below -- and only while at least one target answers, see Known limitations |
+| Multi-cluster Gateway / Anthos Service Mesh | Mesh-aware routing across a GKE Fleet | GCP/Anthos-attached clusters only | Varies, not built for this |
 
 ## Architecture
 
